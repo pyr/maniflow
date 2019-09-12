@@ -40,7 +40,7 @@
     (-> context
         (update ::index inc)
         (assoc  ::updated-at timestamp)
-        (update ::steps conj {::id id ::timing timing}))))
+        (update ::steps assoc ::id id ::timing timing))))
 
 (defn ^:no-doc rethrow-exception-fn
   "When chains fail, augment the thrown exception with the current
@@ -48,10 +48,9 @@
   [context]
   (fn [e]
     (let [data  (ex-data e)
-          extra {:type     :error/fault
-                 ::cause   e
-                 ::context context}]
-      (throw (ex-info (.getMessage e) (merge extra (ex-data e)))))))
+          extra {:type    :error/fault
+                    ::context context}]
+      (throw (ex-info (.getMessage e) (merge extra data) e)))))
 
 (defn ^:no-doc prepare-step
   "Coerce input to a step"
@@ -127,26 +126,21 @@
 
       [:manifold.lifecycle/id keyword
        :manifold.lifecycle/handler
-       :manifold.lifecycle/guard
-       :manifold.lifecycle/finalizer]
+       :manifold.lifecycle/guard]
 
   - `id` is the unique ID for a step
   - `handler` is the function of the previous result
   - `guard` is an optional predicate of the current context and previous
-    result, preventing execution of the step when yielding false
-  - `finalizer` is an option predicate of the context and result as a tuple
-    which must yield - a potentially transformed - context and result tuple
-
+    preventing execution of the step when yielding false
   Accepts an options map of the following keys:
 
       [:manifold.lifecycle/clock
-       :manifold.lifecycle/result-fn]
+       :manifold.lifecycle/raw-result?]
 
   - `clock` is an optional implementation of `spootnik.clock/Clock`,
     defaulting to the system's wall clock (`spootnik.clock/wall-clock`)
-  - `result-fn` is an optional function of the context and result tuple
-    to yield the final value out of the chain, defaulting to `second`
-    to output the result
+  - `raw-result?` toggles extraction of the result out of the context
+    map, defaults to `false`
    "
   ([init steps]
    (run init steps {}))
@@ -168,38 +162,6 @@
 (s/def ::step (s/keys :req [::id ::handler ::show-context?]
                       :opt [::guard ::finalizer ::description]))
 
-(comment
-  ;; some infered names, some explicit
-  (prepare-steps {} [:multiply-by-two (partial * 2)])
-  @(run 0 [#'inc #'inc [:multiply-by-two (partial * 2)]])
-
-  ;; unnamed steps
-  @(run {} [#(assoc % :a 0) #(d/future (update % :a inc))]
-     {::result-fn identity})  (defn error-out
-    [e]
-    (let [{:keys [type] :as data} (ex-data e)]
-      (when (or (nil? type) (= :error/fault type))
-        (log-and-report-error (:manifold.lifecycle/context data)))
-      (format-error e data)))
-
-  (defn report-timings
-    [context]
-    (d/future
-      (doseq [{:manifold.lifecycle/keys [name timing]}
-              (get context :manifold.lifecycle/output)]
-        (send-timing-data name timing)))
-    (report-timing name timing))
-
-
-  (fn [request]
-    (-> (run request [#'find-route
-                      #'deserialie
-                      #'coerce-input
-                      #'normalize
-                      #'validate-in
-                      #'dispatch-to-handler
-                      #'coerce-output
-                      #'serialize]
-          {:manifold.lifecycle/result-fn report-timing})
-        (d/catch error-out)
-        (d/finally report-timing))))
+(s/def ::clock ::clock/clock)
+(s/def ::raw-result? (s/nilable boolean?))
+(s/def ::opts (s/keys :opt [::clock ::raw-result?]))
