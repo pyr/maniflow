@@ -50,6 +50,9 @@
   "Coerce input to a step"
   [input]
   (cond
+    (map? input)
+    input
+
     (var? input)
     (let [{:keys [ns name]} (meta input)]
       {::id            (keyword (str ns) (str name))
@@ -66,7 +69,6 @@
      ::handler       input
      ::show-context? false}
 
-    (map? input)    input
     :else           (throw (ex-info "invalid step definition"
                                     {:error/type :error/invalid}))))
 
