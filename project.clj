@@ -5,7 +5,8 @@
             :url  "https://github.com/pyr/maniflow/tree/master/LICENSE"}
   :plugins [[lein-codox "0.10.7"]]
   :codox {:source-uri "https://github.com/pyr/maniflow/blob/{version}/{filepath}#L{line}"
-          :metadat {:doc/format :markdown}}
+          :metadata {:doc/format :markdown}
+          :doc-files ["README.md"]}
   :dependencies [[org.clojure/clojure "1.10.1"]
                  [spootnik/commons    "0.3.2"]
                  [manifold            "0.1.8"]]

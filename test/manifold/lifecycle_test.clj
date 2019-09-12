@@ -16,7 +16,11 @@
          (prepare-steps {} [:a :b]))))
 
 (deftest simple-lifecycles
+  (is (= 3 @(run 0 [inc inc inc])))
+
   (is (= 4 @(run 0 [#'inc #'inc (partial * 2)])))
+
+  (is (= 0 @(run {:a 0} [:a])))
 
   (is (= {:a 1}
          @(run {} [#(assoc % :a 0)

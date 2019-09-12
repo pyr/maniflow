@@ -15,12 +15,6 @@
             [clojure.spec.alpha :as s]
             [manifold.deferred  :as d]))
 
-(def ^:no-doc extract-result
-  "Result extractor"
-  {::id            ::result
-   ::show-context? true
-   ::handler       ::result})
-
 (defn ^:no-doc initialize-context
   "Create a context which will be threaded between executions"
   [{::keys [clock] :or {clock clock/wall-clock}} init]
@@ -56,11 +50,6 @@
   "Coerce input to a step"
   [input]
   (cond
-    (vector? input)
-    {::id            (first input)
-     ::handler       (second input)
-     ::show-context? false}
-
     (var? input)
     (let [{:keys [ns name]} (meta input)]
       {::id            (keyword (str ns) (str name))
@@ -115,24 +104,39 @@
    in opts to `run` will ensure this is not the case"
   [{::keys [raw-result?]} steps]
   (cond-> (mapv prepare-step steps)
-    (not raw-result?) (conj extract-result)))
+    (not raw-result?)
+    (conj {::id            ::result
+           ::show-context? true
+           ::handler       ::result})))
 
 (defn run
   "
   Run a series of potentially asynchronous steps in sequence
-  on an initial value, threading each step's result to the next step.
+  on an initial value (`init`0, threading each step's result to
+  the next step.
 
   Steps are maps or the following keys:
 
-      [:manifold.lifecycle/id keyword
+      [:manifold.lifecycle/id
        :manifold.lifecycle/handler
+       :manifold.lifecycle/show-context?
        :manifold.lifecycle/guard]
 
   - `id` is the unique ID for a step
   - `handler` is the function of the previous result
+  - `show-context?` determines whether the handler is fed
+    the context map or the result. When false, the output
+    is considered to be the result, not the context.
   - `guard` is an optional predicate of the current context and previous
     preventing execution of the step when yielding false
-  Accepts an options map of the following keys:
+
+  Steps can also be provided as functions or vars, in which case it is
+  assumed that `show-context?` is false for the step, and ID is inferred
+  or generated.
+
+
+  In the three-arity version, an extra options maps can
+  be provided, with the following keys:
 
       [:manifold.lifecycle/clock
        :manifold.lifecycle/raw-result?]
@@ -156,11 +160,10 @@
 (s/def ::id keyword?)
 (s/def ::handler #(instance? clojure.lang.IFn %))
 (s/def ::guard #(instance? clojure.lang.IFn %))
-(s/def ::finalizer #(instance? clojure.lang.IFn %))
 (s/def ::description string?)
 (s/def ::show-context? boolean?)
 (s/def ::step (s/keys :req [::id ::handler ::show-context?]
-                      :opt [::guard ::finalizer ::description]))
+                      :opt [::guard ::description]))
 
 (s/def ::clock ::clock/clock)
 (s/def ::raw-result? (s/nilable boolean?))
