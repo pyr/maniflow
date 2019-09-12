@@ -15,17 +15,24 @@
             [clojure.spec.alpha :as s]
             [manifold.deferred  :as d]))
 
-(defn initialize-context
+(def ^:no-doc extract-result
+  "Result extractor"
+  {::id            ::result
+   ::show-context? true
+   ::handler       ::result})
+
+(defn ^:no-doc initialize-context
   "Create a context which will be threaded between executions"
-  [{::keys [clock] :or {clock clock/wall-clock}}]
+  [{::keys [clock] :or {clock clock/wall-clock}} init]
   (let [timestamp (clock/epoch clock)]
     {::created-at timestamp
      ::updated-at timestamp
+     ::result     init
      ::index      0
-     ::steps      []
+     ::output     []
      ::clock      clock}))
 
-(defn augment-context
+(defn ^:no-doc augment-context
   "Called after a step to record timing"
   [{::keys [clock] :as context} id last-update]
   (let [timestamp (clock/epoch clock)
@@ -35,35 +42,47 @@
         (assoc  ::updated-at timestamp)
         (update ::steps conj {::id id ::timing timing}))))
 
-(defn rethrow-exception-fn
+(defn ^:no-doc rethrow-exception-fn
   "When chains fail, augment the thrown exception with the current
    context state"
   [context]
   (fn [e]
     (let [data  (ex-data e)
-          extra {:type :error/fault ::cause e ::context context}]
+          extra {:type     :error/fault
+                 ::cause   e
+                 ::context context}]
       (throw (ex-info (.getMessage e) (merge extra (ex-data e)))))))
 
-(defn var-step
-  "Yield a valid step given a var"
-  [v]
-  {:pre (var? v)}
-  (let [{:keys [ns name]} (meta v)]
-    {::id      (keyword (str ns) (str name))
-     ::handler (var-get v)}))
-
-(defn prepare-step
+(defn ^:no-doc prepare-step
   "Coerce input to a step"
   [input]
   (cond
-    (vector? input) {::id (first input) ::handler (second input)}
-    (var? input)    (var-step input)
+    (vector? input)
+    {::id            (first input)
+     ::handler       (second input)
+     ::show-context? false}
+
+    (var? input)
+    (let [{:keys [ns name]} (meta input)]
+      {::id            (keyword (str ns) (str name))
+       ::show-context? false
+       ::handler       (var-get input)})
+
+    (keyword? input)
+    {::id            input
+     ::handler       input
+     ::show-context? false}
+
+    (instance? clojure.lang.IFn input)
+    {::id            (keyword (gensym "step"))
+     ::handler       input
+     ::show-context? false}
+
     (map? input)    input
-    (fn? input)     {::id (keyword (gensym "step")) ::handler input}
     :else           (throw (ex-info "invalid step definition"
                                     {:error/type :error/invalid}))))
 
-(defn wrap-step-fn
+(defn ^:no-doc wrap-step-fn
   "Wrap each lifecycle step. This yields a function which will run a
    step's handler. If a guard is present, the execution of the function
    will be dependent on the guard's success, if a finalizer is present,
@@ -72,21 +91,32 @@
    Any exception caught will be rethrown with the current context
    state attached."
   [{::keys [clock]}]
-  (bound-fn [{::keys [id handler guard finalizer] :as step}]
+  (bound-fn [{::keys [id handler guard finalizer show-context?] :as step}]
     {:pre [(s/valid? ::step step)]}
-    (bound-fn [[context res]]
-      (let [timestamp (clock/epoch clock)
-            context   (augment-context context id timestamp)
-            rethrow   (rethrow-exception-fn context)]
+    (bound-fn [{::keys [result] :as context}]
+      (let [timestamp    (clock/epoch clock)
+            context      (augment-context context id timestamp)
+            input        (if show-context? context result)
+            rethrow      (rethrow-exception-fn context)]
         (try
-          (if (or (nil? guard) (guard context res))
-            (-> (handler res)
-                (d/chain (juxt (constantly context) identity))
-                (cond-> (some? finalizer) (d/chain finalizer))
-                (d/catch rethrow))
-            res)
+          (if (or (nil? guard) (guard context))
+            (d/catch
+                (cond-> (handler input)
+                  (not show-context?) (d/chain #(assoc context ::result %))
+                  (some? finalizer)   (d/chain finalizer))
+                rethrow)
+            input)
           (catch Exception e
             (rethrow e)))))))
+
+(defn ^:no-doc prepare-steps
+  "Prepares chain function for each given step.
+   By default, the result is extracted out of a chain at
+   its end, `:manifold.lifecyle/raw-result?` set to true
+   in opts to `run` will ensure this is not the case"
+  [{::keys [raw-result?]} steps]
+  (cond-> (mapv prepare-step steps)
+    (not raw-result?) (conj extract-result)))
 
 (defn run
   "
@@ -121,26 +151,26 @@
   ([init steps]
    (run init steps {}))
   ([init steps opts]
-   (let [context (initialize-context opts)
-         result  (or (get opts ::result-fn) second)
-         prepare (comp (wrap-step-fn context) prepare-step)]
-     (apply d/chain [context init]
-            (conj (mapv prepare steps) result)))))
+   (let [context (initialize-context opts init)]
+     (apply d/chain context
+            (->> (prepare-steps opts steps)
+                 (map (wrap-step-fn context)))))))
 
 ;; Specs
 ;; =====
 
 (s/def ::id keyword?)
-(s/def ::handler fn?)
-(s/def ::guard fn?)
-(s/def ::finalizer fn?)
+(s/def ::handler #(instance? clojure.lang.IFn %))
+(s/def ::guard #(instance? clojure.lang.IFn %))
+(s/def ::finalizer #(instance? clojure.lang.IFn %))
 (s/def ::description string?)
-(s/def ::step (s/keys :req [::id ::handler]
+(s/def ::show-context? boolean?)
+(s/def ::step (s/keys :req [::id ::handler ::show-context?]
                       :opt [::guard ::finalizer ::description]))
-
 
 (comment
   ;; some infered names, some explicit
+  (prepare-steps {} [:multiply-by-two (partial * 2)])
   @(run 0 [#'inc #'inc [:multiply-by-two (partial * 2)]])
 
   ;; unnamed steps
@@ -153,10 +183,10 @@
       (format-error e data)))
 
   (defn report-timings
-    [[context result]]
+    [context]
     (d/future
       (doseq [{:manifold.lifecycle/keys [name timing]}
-              (get context :manifold.lifecycle/steps)]
+              (get context :manifold.lifecycle/output)]
         (send-timing-data name timing)))
     (report-timing name timing))
 
