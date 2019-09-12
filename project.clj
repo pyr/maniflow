@@ -1,4 +1,4 @@
-(defproject spootnik/maniflow "0.1.3-SNAPSHOT"
+(defproject spootnik/maniflow "0.1.3"
   :description "Additional utilies on top of manifold"
   :url "https://github.com/pyr/maniflow"
   :license {:name "MIT/ISC License"
