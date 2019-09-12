@@ -28,13 +28,13 @@
 
 (defn ^:no-doc augment-context
   "Called after a step to record timing"
-  [{::keys [clock] :as context} id last-update]
+  [{::keys [clock index] :as context} id last-update]
   (let [timestamp (clock/epoch clock)
         timing    (- timestamp last-update)]
     (-> context
         (update ::index inc)
         (assoc  ::updated-at timestamp)
-        (update ::steps assoc ::id id ::timing timing))))
+        (update ::output conj {::id id ::timing timing}))))
 
 (defn ^:no-doc rethrow-exception-fn
   "When chains fail, augment the thrown exception with the current
@@ -79,19 +79,18 @@
    Any exception caught will be rethrown with the current context
    state attached."
   [{::keys [clock]}]
-  (bound-fn [{::keys [id handler guard finalizer show-context?] :as step}]
+  (bound-fn [{::keys [id handler guard show-context?] :as step}]
     {:pre [(s/valid? ::step step)]}
     (bound-fn [{::keys [result] :as context}]
-      (let [timestamp    (clock/epoch clock)
-            context      (augment-context context id timestamp)
-            input        (if show-context? context result)
-            rethrow      (rethrow-exception-fn context)]
+      (let [context (augment-context context id (clock/epoch clock))
+            input   (if show-context? context result)
+            rethrow (rethrow-exception-fn context)]
         (try
           (if (or (nil? guard) (guard context))
             (d/catch
                 (cond-> (handler input)
-                  (not show-context?) (d/chain #(assoc context ::result %))
-                  (some? finalizer)   (d/chain finalizer))
+                  (not show-context?)
+                  (d/chain #(assoc context ::result %)))
                 rethrow)
             input)
           (catch Exception e

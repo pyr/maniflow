@@ -34,3 +34,16 @@
                (catch Exception e e))]
     (is (= ArithmeticException (class (.getCause e))))
     (is (= 1 (get-in (ex-data e) [::lc/context ::lc/index])))))
+
+(deftest timings-test
+  (let [clock (reify spootnik.clock.Clock (epoch [this] 0))]
+    (is (= @(run 0 [#'inc #'inc]
+              {::lc/clock       clock
+               ::lc/raw-result? true})
+           {::lc/index      2
+            ::lc/created-at 0
+            ::lc/updated-at 0
+            ::lc/result     2
+            ::lc/output     [{::lc/id :clojure.core/inc ::lc/timing 0}
+                             {::lc/id :clojure.core/inc ::lc/timing 0}]
+            ::lc/clock      clock}))))
