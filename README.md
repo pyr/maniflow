@@ -104,4 +104,19 @@ The clock options is an implementations of `spootnik.clock.Clock` from
 the context map. `raw-result?` defaults to false and determines whether
 the deferred that `run` yields the result or the context map.
 
+### Error handling
 
+There are intentionally no facilities to interact with the sequence of
+steps in this library. Exceptions thrown will break the sequence of
+steps, users of the library are encouraged to use
+`manifold.deferred/catch` to handle errors raised during execution.
+
+All errors contain the underlying thrown exception as a cause and
+contain the last known context in their `ex-data`
+
+```clojure
+(-> (d/run 0 [inc #(d/future (/ % 0)) inc])
+    (d/catch (fn [e]
+	            (type (.getCause e)) ;; ArithmeticException
+				(:manifold.lifecycle/context (ex-data e)) ;; last context)))
+```

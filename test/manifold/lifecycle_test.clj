@@ -25,3 +25,12 @@
   (is (= {:a 1}
          @(run {} [#(assoc % :a 0)
                    #(d/future (update % :a inc))]))))
+
+(deftest errors-in-lifecycles
+  (is (thrown? clojure.lang.ExceptionInfo
+               @(run 0 [(partial / 0)])))
+
+  (let [e (try @(run 0 [(partial / 0)])
+               (catch Exception e e))]
+    (is (= ArithmeticException (class (.getCause e))))
+    (is (= 1 (get-in (ex-data e) [::lc/context ::lc/index])))))
