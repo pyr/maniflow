@@ -4,15 +4,9 @@
             [manifold.deferred  :as d]))
 
 (deftest prepare-steps-output
-  (is (= [{::lc/id            :a
-           ::lc/handler       :a
-           ::lc/show-context? false}
-          {::lc/id            :b
-           ::lc/handler       :b
-           ::lc/show-context? false}
-          {::lc/id            ::lc/result
-           ::lc/handler       ::lc/result
-           ::lc/show-context? true}]
+  (is (= [(step :a :a)
+          (step :b :b)
+          (step ::lc/input ::lc/input :context? true)]
          (prepare-steps {} [:a :b]))))
 
 (deftest simple-lifecycles
@@ -38,12 +32,12 @@
 (deftest timings-test
   (let [clock (reify spootnik.clock.Clock (epoch [this] 0))]
     (is (= @(run 0 [#'inc #'inc]
-              {::lc/clock       clock
-               ::lc/raw-result? true})
+              {::lc/clock    clock
+               ::lc/context? true})
            {::lc/index      2
             ::lc/created-at 0
             ::lc/updated-at 0
-            ::lc/result     2
+            ::lc/input      2
             ::lc/output     [{::lc/id :clojure.core/inc ::lc/timing 0}
                              {::lc/id :clojure.core/inc ::lc/timing 0}]
             ::lc/clock      clock}))))

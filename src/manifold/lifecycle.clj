@@ -15,13 +15,25 @@
             [clojure.spec.alpha :as s]
             [manifold.deferred  :as d]))
 
+(defn step
+  "Convenience function to build a step map.
+   Requires and ID and handler, and can be fed
+   additional options"
+  [id handler & {:keys [context? guard]}]
+  (cond->
+      {::id       id
+       ::handler  handler
+       ::context? (or context? false)}
+    (some? guard)
+    (assoc ::guard guard)))
+
 (defn ^:no-doc initialize-context
   "Create a context which will be threaded between executions"
   [{::keys [clock] :or {clock clock/wall-clock}} init]
   (let [timestamp (clock/epoch clock)]
     {::created-at timestamp
      ::updated-at timestamp
-     ::result     init
+     ::input      init
      ::index      0
      ::output     []
      ::clock      clock}))
@@ -55,22 +67,16 @@
 
     (var? input)
     (let [{:keys [ns name]} (meta input)]
-      {::id            (keyword (str ns) (str name))
-       ::show-context? false
-       ::handler       (var-get input)})
+      (step (keyword (str ns) (str name)) (var-get input)))
 
     (keyword? input)
-    {::id            input
-     ::handler       input
-     ::show-context? false}
+    (step input input)
 
     (instance? clojure.lang.IFn input)
-    {::id            (keyword (gensym "step"))
-     ::handler       input
-     ::show-context? false}
+    (step (keyword (gensym "step")) input)
 
-    :else           (throw (ex-info "invalid step definition"
-                                    {:error/type :error/invalid}))))
+    :else (throw (ex-info "invalid step definition"
+                          {:error/type :error/invalid}))))
 
 (defn ^:no-doc wrap-step-fn
   "Wrap each lifecycle step. This yields a function which will run a
@@ -81,18 +87,18 @@
    Any exception caught will be rethrown with the current context
    state attached."
   [{::keys [clock]}]
-  (bound-fn [{::keys [id handler guard show-context?] :as step}]
+  (bound-fn [{::keys [id handler guard context?] :as step}]
     {:pre [(s/valid? ::step step)]}
-    (bound-fn [{::keys [result] :as context}]
+    (bound-fn [{::keys [input] :as context}]
       (let [context (augment-context context id (clock/epoch clock))
-            input   (if show-context? context result)
+            input   (if context? context input)
             rethrow (rethrow-exception-fn context)]
         (try
           (if (or (nil? guard) (guard context))
             (d/catch
                 (cond-> (handler input)
-                  (not show-context?)
-                  (d/chain #(assoc context ::result %)))
+                  (not context?)
+                  (d/chain #(assoc context ::input %)))
                 rethrow)
             input)
           (catch Exception e
@@ -100,21 +106,19 @@
 
 (defn ^:no-doc prepare-steps
   "Prepares chain function for each given step.
-   By default, the result is extracted out of a chain at
-   its end, `:manifold.lifecyle/raw-result?` set to true
+   By default, the input is extracted out of a chain at
+   its end, `:manifold.lifecyle/context?` set to true
    in opts to `run` will ensure this is not the case"
-  [{::keys [raw-result?]} steps]
+  [{::keys [context?]} steps]
   (cond-> (mapv prepare-step steps)
-    (not raw-result?)
-    (conj {::id            ::result
-           ::show-context? true
-           ::handler       ::result})))
+    (not context?)
+    (conj (step ::input ::input :context? true))))
 
 (defn run
   "
   Run a series of potentially asynchronous steps in sequence
   on an initial value (`init`0, threading each step's result to
-  the next step.
+  the next step as input.
 
   Steps are maps or the following keys:
 
@@ -125,14 +129,14 @@
 
   - `id` is the unique ID for a step
   - `handler` is the function of the previous result
-  - `show-context?` determines whether the handler is fed
-    the context map or the result. When false, the output
+  - `context?` determines whether the handler is fed
+    the context map or the plain input. When false, the output
     is considered to be the result, not the context.
   - `guard` is an optional predicate of the current context and previous
     preventing execution of the step when yielding false
 
   Steps can also be provided as functions or vars, in which case it is
-  assumed that `show-context?` is false for the step, and ID is inferred
+  assumed that `context?` is false for the step, and ID is inferred
   or generated.
 
 
@@ -140,11 +144,11 @@
   be provided, with the following keys:
 
       [:manifold.lifecycle/clock
-       :manifold.lifecycle/raw-result?]
+       :manifold.lifecycle/context?]
 
   - `clock` is an optional implementation of `spootnik.clock/Clock`,
     defaulting to the system's wall clock (`spootnik.clock/wall-clock`)
-  - `raw-result?` toggles extraction of the result out of the context
+  - `context?` toggles extraction of the result out of the context
     map, defaults to `false`
    "
   ([init steps]
@@ -162,10 +166,9 @@
 (s/def ::handler #(instance? clojure.lang.IFn %))
 (s/def ::guard #(instance? clojure.lang.IFn %))
 (s/def ::description string?)
-(s/def ::show-context? boolean?)
-(s/def ::step (s/keys :req [::id ::handler ::show-context?]
+(s/def ::context? boolean?)
+(s/def ::step (s/keys :req [::id ::handler ::context?]
                       :opt [::guard ::description]))
 
 (s/def ::clock ::clock/clock)
-(s/def ::raw-result? (s/nilable boolean?))
-(s/def ::opts (s/keys :opt [::clock ::raw-result?]))
+(s/def ::opts (s/keys :opt [::clock ::context?]))
