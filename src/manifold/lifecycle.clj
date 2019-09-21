@@ -11,74 +11,61 @@
   - Guards and finalizer for steps are optional
   - Exceptions during lifecycle steps stop the execution
   "
-  (:require [spootnik.clock     :as clock]
-            [clojure.spec.alpha :as s]
+  (:require [clojure.spec.alpha :as s]
             [manifold.deferred  :as d]))
+
+(defn step*
+  "Convenience function to build a step map.
+   Requires and ID and handler, and can be fed
+   additional options"
+  [id handler {:keys [in out lens guard discard?]}]
+  (let [as-vector #(cond-> % (keyword? %) vector)]
+    (cond-> {:id id :handler handler}
+      (some? in)       (assoc :in (as-vector in))
+      (some? out)      (assoc :out (as-vector out))
+      (some? lens)     (assoc :lens (as-vector lens))
+      (some? guard)    (assoc :guard guard)
+      (some? discard?) (assoc :discard? discard?))))
 
 (defn step
   "Convenience function to build a step map.
    Requires and ID and handler, and can be fed
    additional options"
-  [id handler & {:keys [context? guard]}]
-  (cond->
-      {::id       id
-       ::handler  handler
-       ::context? (or context? false)}
-    (some? guard)
-    (assoc ::guard guard)))
-
-(defn ^:no-doc initialize-context
-  "Create a context which will be threaded between executions"
-  [{::keys [clock] :or {clock clock/wall-clock}} init]
-  (let [timestamp (clock/epoch clock)]
-    {::created-at timestamp
-     ::updated-at timestamp
-     ::input      init
-     ::index      0
-     ::output     []
-     ::clock      clock}))
-
-(defn ^:no-doc augment-context
-  "Called after a step to record timing"
-  [{::keys [clock index] :as context} id last-update]
-  (let [timestamp (clock/epoch clock)
-        timing    (- timestamp last-update)]
-    (-> context
-        (update ::index inc)
-        (assoc  ::updated-at timestamp)
-        (update ::output conj {::id id ::timing timing}))))
+  ([id handler & {:as params}]
+   (step* id handler params))
+  ([handler]
+   {:id (keyword (gensym "handler")) :handler handler}))
 
 (defn ^:no-doc rethrow-exception-fn
   "When chains fail, augment the thrown exception with the current
    context state"
-  [context]
-  (fn [e]
-    (let [data  (ex-data e)
-          extra {:type    :error/fault
-                    ::context context}]
-      (throw (ex-info (.getMessage e) (merge extra data) e)))))
+  [context step]
+  (fn thrower [e]
+    (throw (ex-info (.getMessage e)
+                    {:type    (or (:type (ex-data e)) :error/fault)
+                     :context context
+                     :step    step}
+                    e))))
 
-(defn ^:no-doc prepare-step
-  "Coerce input to a step"
-  [input]
+(defn ^:no-doc set-out-fn
+  "When applicable, yield a function of a result which
+   sets the output in the expected position, as per the
+   step definition"
+  [{:keys [lens out discard?]} context]
   (cond
-    (map? input)
-    input
+    discard?     (constantly context)
+    (some? lens) (partial assoc-in context lens)
+    (some? out)  (partial assoc-in context out)))
 
-    (var? input)
-    (let [{:keys [ns name]} (meta input)]
-      (step (keyword (str ns) (str name)) (var-get input)))
+(defn ^:no-doc extract-input
+  "Fetches the expected part of a threaded context"
+  [{:keys [lens in]} context]
+  (cond
+    (some? lens) (get-in context lens)
+    (some? in)   (get-in context in)
+    :else        context))
 
-    (keyword? input)
-    (step input input)
-
-    (instance? clojure.lang.IFn input)
-    (step (keyword (gensym "step")) input)
-
-    :else (throw (ex-info "invalid step definition"
-                          {:error/type :error/invalid}))))
-
-(defn ^:no-doc wrap-step-fn
+(defn ^:no-doc wrap-step
   "Wrap each lifecycle step. This yields a function which will run a
    step's handler. If a guard is present, the execution of the function
    will be dependent on the guard's success, if a finalizer is present,
@@ -86,33 +73,25 @@
 
    Any exception caught will be rethrown with the current context
    state attached."
-  [{::keys [clock]}]
-  (bound-fn [{::keys [id handler guard context?] :as step}]
-    {:pre [(s/valid? ::step step)]}
-    (bound-fn [{::keys [input] :as context}]
-      (let [context (augment-context context id (clock/epoch clock))
-            input   (if context? context input)
-            rethrow (rethrow-exception-fn context)]
-        (try
-          (if (or (nil? guard) (guard context))
-            (d/catch
-                (cond-> (handler input)
-                  (not context?)
-                  (d/chain #(assoc context ::input %)))
-                rethrow)
-            input)
-          (catch Exception e
-            (rethrow e)))))))
+  [augment {:keys [id handler guard in out lens discard?] :as step}]
+  (fn [context]
+    (let [context (cond-> context (some? augment) (augment step))
+          input   (extract-input step context)
+          set-out (set-out-fn step context)
+          rethrow (rethrow-exception-fn context step)]
+      (try
+        (if (or (nil? guard) (guard context))
+          (cond-> (handler input)
+            (some? set-out) (d/chain set-out)
+            true            (d/catch rethrow))
+          context)
+        (catch Exception e (rethrow e))))))
 
-(defn ^:no-doc prepare-steps
-  "Prepares chain function for each given step.
-   By default, the input is extracted out of a chain at
-   its end, `:manifold.lifecyle/context?` set to true
-   in opts to `run` will ensure this is not the case"
-  [{::keys [context?]} steps]
-  (cond-> (mapv prepare-step steps)
-    (not context?)
-    (conj (step ::input ::input :context? true))))
+(defn- validate-args!
+  [steps opts]
+  (when-not (s/valid? ::args [steps opts])
+    (let [msg (s/explain-str ::args [steps opts])]
+      (throw (ex-info msg {:type :error/incorrect :message msg})))))
 
 (defn run
   "
@@ -122,53 +101,52 @@
 
   Steps are maps or the following keys:
 
-      [:manifold.lifecycle/id
-       :manifold.lifecycle/handler
-       :manifold.lifecycle/show-context?
-       :manifold.lifecycle/guard]
+      [:id :handler :in :out :discard? :guard]
 
   - `id` is the unique ID for a step
   - `handler` is the function of the previous result
-  - `context?` determines whether the handler is fed
-    the context map or the plain input. When false, the output
-    is considered to be the result, not the context.
+  - `in` when present determines which path in the context will
+     be fed to the handler. The handler is considered a function
+     of the contex
+  - `out` when present determines which path in the context to
+     associate the result to, otherwise replaces the full context
+  - `discard?` when present, runs the handler but pass the context
+     untouched to the next step
   - `guard` is an optional predicate of the current context and previous
     preventing execution of the step when yielding false
-
-  Steps can also be provided as functions or vars, in which case it is
-  assumed that `context?` is false for the step, and ID is inferred
-  or generated.
-
 
   In the three-arity version, an extra options maps can
   be provided, with the following keys:
 
-      [:manifold.lifecycle/clock
-       :manifold.lifecycle/context?]
+      [:augment :executor]
 
-  - `clock` is an optional implementation of `spootnik.clock/Clock`,
-    defaulting to the system's wall clock (`spootnik.clock/wall-clock`)
-  - `context?` toggles extraction of the result out of the context
-    map, defaults to `false`
-   "
+  - `augment` is a function called on the context for each step,
+    expected to yield an updated context. This can useful to
+    perform timing tasks
+  - `executor` a manifold executor to execute deferreds on"
   ([init steps]
    (run init steps {}))
-  ([init steps opts]
-   (let [context (initialize-context opts init)]
-     (apply d/chain context
-            (->> (prepare-steps opts steps)
-                 (map (wrap-step-fn context)))))))
+  ([init steps {:keys [initialize augment executor] :as opts}]
+   (validate-args! steps opts)
+   (let [init (cond-> init (some? initialize) initialize)]
+     (cond-> (apply d/chain init (map (partial wrap-step augment) steps))
+       (some? executor) (d/onto executor)))))
 
 ;; Specs
 ;; =====
 
-(s/def ::id keyword?)
-(s/def ::handler #(instance? clojure.lang.IFn %))
-(s/def ::guard #(instance? clojure.lang.IFn %))
-(s/def ::description string?)
-(s/def ::context? boolean?)
-(s/def ::step (s/keys :req [::id ::handler ::context?]
-                      :opt [::guard ::description]))
+(def ^:private callable? #(instance? clojure.lang.IFn %))
 
-(s/def ::clock ::clock/clock)
-(s/def ::opts (s/keys :opt [::clock ::context?]))
+(s/def ::id         keyword?)
+(s/def ::handler    callable?)
+(s/def ::guard      callable?)
+(s/def ::initialize callable?)
+(s/def ::augment    callable?)
+(s/def ::in         vector?)
+(s/def ::out        vector?)
+(s/def ::lens       vector?)
+(s/def ::step       (s/keys :req-un [::id ::handler]
+                            :opt-un [::in ::out ::lens ::guard ::discard?]))
+(s/def ::steps      (s/coll-of ::step))
+(s/def ::opts       (s/keys :opt-un [::initialize ::augment ::executor]))
+(s/def ::args       (s/cat :steps ::steps :opts ::opts))

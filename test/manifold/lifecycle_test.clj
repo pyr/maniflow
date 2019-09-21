@@ -1,43 +1,80 @@
 (ns manifold.lifecycle-test
-  (:require [clojure.test       :refer :all]
-            [manifold.lifecycle :as lc :refer :all]
-            [manifold.deferred  :as d]))
+  (:require [clojure.test              :refer :all]
+            [manifold.lifecycle        :refer :all]
+            [manifold.lifecycle.timing :as timing]
+            [manifold.deferred         :as d]))
 
-(deftest prepare-steps-output
-  (is (= [(step :a :a)
-          (step :b :b)
-          (step ::lc/input ::lc/input :context? true)]
-         (prepare-steps {} [:a :b]))))
+(deftest minimal-lifecycle
+  (is (= 1 @(run 0 [(step inc)]))))
 
 (deftest simple-lifecycles
-  (is (= 3 @(run 0 [inc inc inc])))
+  (is (= 3 @(run 0 [(step inc) (step inc) (step inc)])))
 
-  (is (= 4 @(run 0 [#'inc #'inc (partial * 2)])))
+  (is (= 4 @(run 0 [(step inc) (step inc) (step (partial * 2))])))
 
-  (is (= 0 @(run {:a 0} [:a])))
+  (is (= 0 @(run {:a 0} [(step :a)])))
 
   (is (= {:a 1}
-         @(run {} [#(assoc % :a 0)
-                   #(d/future (update % :a inc))]))))
+         @(run {} [(step #(assoc % :a 0))
+                   (step #(d/future (update % :a inc)))]))))
+
+(deftest lifecycles-with-parmeters
+  (is (= {:x 3}
+         @(run {:x 0} [(step :inc inc :lens :x)
+                       (step :inc inc :lens :x)
+                       (step :inc inc :lens :x)])))
+
+  (is (= {:x 3}
+         @(run {:x 0} [(step :inc inc :lens :x :guard (constantly true))
+                       (step :inc inc :lens :x :guard (constantly true))
+                       (step :inc inc :lens :x :guard (constantly true))])))
+
+  (is (= 3
+         @(run {:x 0} [(step :inc inc :lens :x :guard (constantly true))
+                       (step :inc inc :lens :x :guard (constantly true))
+                       (step :inc inc :in :x :guard (constantly true))])))
+
+  (is (= {:x 0}
+         @(run {:x 0} [(step :inc inc :lens :x :guard (constantly true) :discard? true)
+                       (step :inc inc :lens :x :guard (constantly true) :discard? true)
+                       (step :inc inc :in :x :guard (constantly true) :discard? true)])))
+
+  (is (= {:status  200
+          :headers {:content-type "text/plain"}
+          :body    "hello"}
+         @(run {:request {:uri "/"}}
+            [(step :handler (constantly {:body "hello"})
+                   :in :request
+                   :out :response)
+             (step :status (constantly 200)
+                   :in :response
+                   :out [:response :status])
+             (step :content-type #(assoc-in % [:headers :content-type] "text/plain")
+                   :in :response)])))
+
+  (is (= {:x 0}
+         @(run {:x 0} [(step :inc inc :lens :x :guard (constantly false))
+                       (step :inc inc :lens :x :guard (constantly false))
+                       (step :inc inc :lens :x :guard (constantly false))]))))
 
 (deftest errors-in-lifecycles
   (is (thrown? clojure.lang.ExceptionInfo
-               @(run 0 [(partial / 0)])))
+               @(run 0 [(step (partial / 0))])))
 
-  (let [e (try @(run 0 [(partial / 0)])
+  (let [e (try @(run 0 [(step (partial / 0))])
                (catch Exception e e))]
-    (is (= ArithmeticException (class (.getCause e))))
-    (is (= 1 (get-in (ex-data e) [::lc/context ::lc/index])))))
+    (is (= ArithmeticException (class (.getCause e))))))
 
 (deftest timings-test
-  (let [clock (reify spootnik.clock.Clock (epoch [this] 0))]
-    (is (= @(run 0 [#'inc #'inc]
-              {::lc/clock    clock
-               ::lc/context? true})
-           {::lc/index      2
-            ::lc/created-at 0
-            ::lc/updated-at 0
-            ::lc/input      2
-            ::lc/output     [{::lc/id :clojure.core/inc ::lc/timing 0}
-                             {::lc/id :clojure.core/inc ::lc/timing 0}]
-            ::lc/clock      clock}))))
+  (let [clock (let [state (atom 0)] (fn [] (first (swap-vals! state inc))))]
+    (is (= @(run
+              {:x 0}
+              [(step :inc inc :lens :x)
+               (step :inc inc :lens :x)]
+              (timing/make clock))
+           {:x      2
+            :timing {:created-at 0
+                     :updated-at 2
+                     :index      2
+                     :output     [{:id :inc :timing 1}
+                                  {:id :inc :timing 1}]}}))))
