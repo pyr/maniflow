@@ -3,7 +3,7 @@
               [k version :exclusions exclusions])
       paths (:paths cfg)]
 
-  (defproject spootnik/maniflow "0.1.7"
+  (defproject spootnik/maniflow "0.1.8-SNAPSHOT"
     :description "Additional utilies on top of manifold"
     :url "https://github.com/pyr/maniflow"
     :license {:name "MIT/ISC License"
