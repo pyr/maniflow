@@ -12,15 +12,19 @@
   - Exceptions during lifecycle steps stop the execution
   "
   (:require [clojure.spec.alpha :as s]
-            [manifold.deferred  :as d]))
+            [manifold.deferred  :as d]
+            [manifold.executor  :as pool]))
 
 (defn step*
   "Convenience function to build a step map.
    Requires and ID and handler, and can be fed
    additional options"
-  [id handler {:keys [in out lens guard discard?]}]
-  (let [as-vector #(cond-> % (keyword? %) vector)]
-    (cond-> {:id id :handler handler}
+  [id handlers {:keys [in out lens guard discard?]}]
+  (let [as-vector     #(cond-> % (not (sequential? %)) vector)
+        [enter leave] (as-vector handlers)]
+    (cond-> {:id id}
+      (some? enter)    (assoc :enter enter)
+      (some? leave)    (assoc :leave leave)
       (some? in)       (assoc :in (as-vector in))
       (some? out)      (assoc :out (as-vector out))
       (some? lens)     (assoc :lens (as-vector lens))
@@ -31,10 +35,11 @@
   "Convenience function to build a step map.
    Requires and ID and handler, and can be fed
    additional options"
-  ([id handler & {:as params}]
-   (step* id handler params))
-  ([handler]
-   {:id (keyword (gensym "handler")) :handler handler}))
+  ;;  [id enter leave & {:as params}]
+  ([enter]
+   (step (keyword (gensym "handler")) [enter]))
+  ([id handlers & {:as params}]
+   (step* id handlers params)))
 
 (defn ^:no-doc rethrow-exception-fn
   "When chains fail, augment the thrown exception with the current
@@ -47,7 +52,7 @@
                      :step    step}
                     e))))
 
-(defn ^:no-doc set-out-fn
+(defn ^:no-doc assoc-result-fn
   "When applicable, yield a function of a result which
    sets the output in the expected position, as per the
    step definition"
@@ -55,7 +60,8 @@
   (cond
     discard?     (constantly context)
     (some? lens) (partial assoc-in context lens)
-    (some? out)  (partial assoc-in context out)))
+    (some? out)  (partial assoc-in context out)
+    :else        identity))
 
 (defn ^:no-doc extract-input
   "Fetches the expected part of a threaded context"
@@ -65,33 +71,86 @@
     (some? in)   (get-in context in)
     :else        context))
 
-(defn ^:no-doc wrap-step
-  "Wrap each lifecycle step. This yields a function which will run a
-   step's handler. If a guard is present, the execution of the function
-   will be dependent on the guard's success, if a finalizer is present,
-   it will be ran.
-
-   Any exception caught will be rethrown with the current context
-   state attached."
-  [augment {:keys [id handler guard in out lens discard?] :as step}]
-  (fn [context]
-    (let [context (cond-> context (some? augment) (augment step))
-          input   (extract-input step context)
-          set-out (set-out-fn step context)
-          rethrow (rethrow-exception-fn context step)]
-      (try
-        (if (or (nil? guard) (guard context))
-          (cond-> (handler input)
-            (some? set-out) (d/chain set-out)
-            true            (d/catch rethrow))
-          context)
-        (catch Exception e (rethrow e))))))
+(defn ^:no-doc run-step
+  "Run a single step in a lifecycle. Takes care of honoring `augment`,
+   `stop-on`, `guard`, and position (`in`, `out`, or `lens`) specifications."
+  [{:keys [handler guard in out lens discard? augment stop-on] :as step} context]
+  (let [context (cond-> context (some? augment) (augment step))
+        rethrow (rethrow-exception-fn context step)]
+    (try
+      (if (or (nil? guard) (guard context))
+        (-> (d/chain (handler (extract-input step context))
+                     (assoc-result-fn step context)
+                     (juxt identity stop-on))
+            (d/catch rethrow))
+        [context])
+      (catch Exception e (rethrow e)))))
 
 (defn- validate-args!
-  [steps opts]
-  (when-not (s/valid? ::args [steps opts])
-    (let [msg (s/explain-str ::args [steps opts])]
+  "Throw early on invalid configuration"
+  [opts steps]
+  (when-not (s/valid? ::args [opts steps])
+    (let [msg (s/explain-str ::args [opts steps])]
       (throw (ex-info msg {:type :error/incorrect :message msg})))))
+
+(defn prepare-stage
+  "Prepare a single stage, discard steps which do not have a handler
+   for a specific stage."
+  [stage opts steps]
+  (let [clean-stages #(apply dissoc % (:stages opts [:enter :leave]))
+        extra        {:augment (:augment opts)
+                      :stop-on (or (:stop-on opts)
+                                   (:terminate-when opts)
+                                   (constantly false))}]
+    (vec (for [step  steps
+               :let  [handler (get step stage)]
+               :when (some? handler)]
+           (-> step
+               (assoc :stage stage :handler handler)
+               (dissoc stage)
+               (clean-stages)
+               (merge extra))))))
+
+(defn ^:no-doc build-stages
+  "Given a list of steps, prepare a flat vector of actions
+   to take in sequence. If options do not specify a stage,
+   assume `:enter` and `:leave`"
+  [{:keys [stages] :as opts} steps]
+  (loop [[stage & stages] (or stages [:enter :leave])
+         steps            steps
+         prepared         []]
+    (if (nil? stage)
+      (vec prepared)
+      (recur stages
+             (reverse steps)
+             (concat prepared (prepare-stage stage opts steps))))))
+
+(defprotocol ^:no-doc Restarter
+  "A protocol to allow restarts"
+  (restart-step [this step]  "Run an asynchronous operation")
+  (restart      [this value] "Success callback"))
+
+(defrecord DeferredRestarter [executor steps result]
+  Restarter
+  (restart-step [this value]
+    (let [[step & steps] steps]
+      (d/on-realized (d/chain (d/future-with executor (run-step step value)))
+                     (partial restart (assoc this :steps steps))
+                     (partial d/error! result))))
+  (restart [this [value stop?]]
+    (let [step (first steps)]
+      (cond
+        (nil? step) (d/success! result value)
+        stop?       (d/success! result value)
+        :else       (restart-step this value)))))
+
+(defn ^:no-doc make-restarter
+  "Build a restarter"
+  [opts steps]
+  (DeferredRestarter.
+    (or (:executor opts) (pool/execute-pool))
+    (build-stages opts steps)
+    (d/deferred)))
 
 (defn run
   "
@@ -101,10 +160,11 @@
 
   Steps are maps or the following keys:
 
-      [:id :handler :in :out :discard? :guard]
+      [:id :enter :leave :in :out :discard? :guard]
 
   - `id` is the unique ID for a step
-  - `handler` is the function of the previous result
+  - `enter` is the function of the previous result in the enter stage
+  - `leave` is the function of the previous result in the leave stage
   - `in` when present determines which path in the context will
      be fed to the handler. The handler is considered a function
      of the contex
@@ -118,35 +178,48 @@
   In the three-arity version, an extra options maps can
   be provided, with the following keys:
 
-      [:augment :executor]
+      [:augment :executor :initialize :stages :stop-on]
 
   - `augment` is a function called on the context for each step,
     expected to yield an updated context. This can useful to
     perform timing tasks
-  - `executor` a manifold executor to execute deferreds on"
+  - `executor` a manifold executor to execute deferreds on
+  - `initialize` is a function called on the context before
+    running the lifecycle.
+  - `stages` a list of stages to run through, defaults to
+    `:enter` and `:leave`. Every second stage is run in reverse
+    order.
+  - `stop-on` predicate which determines whether an early stop is
+    mandated, for compatibility with interceptors `terminate-when`
+    is synonymous."
   ([init steps]
-   (run init steps {}))
-  ([init steps {:keys [initialize augment executor] :as opts}]
-   (validate-args! steps opts)
-   (let [init (cond-> init (some? initialize) initialize)]
-     (cond-> (apply d/chain init (map (partial wrap-step augment) steps))
-       (some? executor) (d/onto executor)))))
+   (run init {} steps))
+  ([init opts steps]
+   (validate-args! opts steps)
+   (let [initialize (or (:initialize opts) identity)
+         restarter  (make-restarter opts steps)]
+     (restart-step restarter (initialize init))
+     (:result restarter))))
 
 ;; Specs
 ;; =====
 
-(def ^:private callable? #(instance? clojure.lang.IFn %))
-
 (s/def ::id         keyword?)
-(s/def ::handler    callable?)
-(s/def ::guard      callable?)
-(s/def ::initialize callable?)
-(s/def ::augment    callable?)
+(s/def ::handler    (partial instance? clojure.lang.IFn))
+(s/def ::enter      (partial instance? clojure.lang.IFn))
+(s/def ::leave      (partial instance? clojure.lang.IFn))
+(s/def ::guard      (partial instance? clojure.lang.IFn))
+(s/def ::initialize (partial instance? clojure.lang.IFn))
+(s/def ::augment    (partial instance? clojure.lang.IFn))
+(s/def ::stop-on    (partial instance? clojure.lang.IFn))
+(s/def ::stages     (s/coll-of keyword?))
 (s/def ::in         vector?)
 (s/def ::out        vector?)
 (s/def ::lens       vector?)
-(s/def ::step       (s/keys :req-un [::id ::handler]
-                            :opt-un [::in ::out ::lens ::guard ::discard?]))
+(s/def ::step       (s/keys :req-un [::id]
+                            :opt-un [::enter ::leave ::in ::out ::lens
+                                     ::guard ::discard?]))
 (s/def ::steps      (s/coll-of ::step))
-(s/def ::opts       (s/keys :opt-un [::initialize ::augment ::executor]))
-(s/def ::args       (s/cat :steps ::steps :opts ::opts))
+(s/def ::opts       (s/keys :opt-un [::stages ::stop-on ::initialize
+                                     ::augment ::executor]))
+(s/def ::args       (s/cat :opts ::opts :steps ::steps))

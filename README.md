@@ -11,7 +11,10 @@ maniflow: utilities on top of manifold
 
 The `manifold.lifecycle` namespace provides a lightweight take on a
 mechanism similar to [interceptors](http://pedestal.io/reference/interceptors)
-or [sieppari](https://github.com/metosin/sieppari).
+or [sieppari](https://github.com/metosin/sieppari). A key difference with
+interceptors is that individual handlers have no access to the step chain
+and thus cannot interact with it. Guards and early termination are still
+provided.
 
 A lifecycle is nothing more than a collection of handlers through
 which a value is passed.
@@ -34,9 +37,9 @@ As shown above, each step in a lifecycle is a handler to run on a value.
 Steps can be provided in several forms, all coerced to a map.
 
 ```clojure
-{:id      :doubler
- :handler (fn [input] (* input 2))
- :guard   (fn [context] ...)}
+{:id    :doubler
+ :enter (fn [input] (* input 2))
+ :guard (fn [context] ...)}
 ```
 
 #### Function steps
@@ -45,16 +48,16 @@ When a step is a plain function, as in `(run 0 [inc])`, the
 resulting map will be of the following shape:
 
 ```clojure
-{:id      :step12345
- :handler inc}
+{:id    :step12345
+ :enter inc}
 ```
 
 If the function is provided as a var, the qualified name of the var
 is used as the id, so for `(run 0 [#'inc])` we would have instead:
 
 ```clojure
-{:id      :inc
- :handler inc}
+{:id    :inc
+ :enter inc}
 ```
 
 #### Accessing parts of the input
@@ -72,10 +75,10 @@ this, maniflow provides three parameters for steps:
   acts as though both `:in` and `:out` where provided
 
 ```clojure
-{:id      :determine-deserialize
- :handler (partial = :post)
- :in      [:request :request-method]
- :out     [::need-deserialize?])
+{:id    :determine-deserialize
+ :enter (partial = :post)
+ :in    [:request :request-method]
+ :out   [::need-deserialize?])
 ```
 
 #### Step guards
@@ -84,10 +87,10 @@ Based on the current state of processing, it might be useful to guard
 execution of a step against a predicate, keeping with the last example:
 
 ```clojure
-{:id      :deserialize
- :handler deserialize
- :lens    [:request :body]
- :guard   ::need-deserialize?}
+{:id    :deserialize
+ :enter deserialize
+ :lens  [:request :body]
+ :guard ::need-deserialize?}
 ```
 
 #### Discarding results
@@ -96,7 +99,7 @@ Sometimes,
 
 ```clojure
 {:id       :debug
- :handler  prn
+ :enter    prn
  :discard? true}
 ```
 
@@ -106,10 +109,10 @@ The `manifold.lifecycle/step` function is provided to build steps
 easily, the above can thus be rewritten:
 
 ```clojure
-(step :determine-deserialize (partial = :post) :in [:request :request-method] :out ::need-deserialize?)
-(step :debug prn :discard? true)
-(step :deserialize deserialize :guard ::need-deserialize?)
-(step :handler run-handler)
+(enter-step :determine-deserialize (partial = :post) :in [:request :request-method] :out ::need-deserialize?)
+(enter-step :debug prn :discard? true)
+(enter-step :deserialize deserialize :guard ::need-deserialize?)
+(enter-step :handler run-handler)
 ```
 
 ### Global options
