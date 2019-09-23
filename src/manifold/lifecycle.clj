@@ -15,13 +15,16 @@
             [manifold.deferred  :as d]
             [manifold.executor  :as pool]))
 
+(defn- ^:no-doc as-vector
+  [x]
+  (cond-> x (not (sequential? x)) vector))
+
 (defn step*
   "Convenience function to build a step map.
    Requires and ID and handler, and can be fed
    additional options"
   [id handlers {:keys [in out lens guard discard?]}]
-  (let [as-vector     #(cond-> % (not (sequential? %)) vector)
-        [enter leave] (as-vector handlers)]
+  (let [[enter leave] (as-vector handlers)]
     (cond-> {:id id}
       (some? enter)    (assoc :enter enter)
       (some? leave)    (assoc :leave leave)
@@ -130,7 +133,7 @@
   (restart-step [this step]  "Run an asynchronous operation")
   (restart      [this value] "Success callback"))
 
-(defrecord DeferredRestarter [executor steps result]
+(defrecord DeferredRestarter [executor steps out result]
   Restarter
   (restart-step [this value]
     (let [[step & steps] steps]
@@ -138,10 +141,11 @@
                      (partial restart (assoc this :steps steps))
                      (partial d/error! result))))
   (restart [this [value stop?]]
-    (let [step (first steps)]
+    (let [step (first steps)
+          exit (cond-> value (some? out) (get-in out))]
       (cond
-        (nil? step) (d/success! result value)
-        stop?       (d/success! result value)
+        (nil? step) (d/success! result exit)
+        stop?       (d/success! result exit)
         :else       (restart-step this value)))))
 
 (defn ^:no-doc make-restarter
@@ -150,6 +154,7 @@
   (DeferredRestarter.
     (or (:executor opts) (pool/execute-pool))
     (build-stages opts steps)
+    (:out opts)
     (d/deferred)))
 
 (defn run
@@ -186,6 +191,8 @@
   - `executor` a manifold executor to execute deferreds on
   - `initialize` is a function called on the context before
     running the lifecycle.
+  - `out` a path in the context to retrieve as the final
+     value out of the lifecycle
   - `stages` a list of stages to run through, defaults to
     `:enter` and `:leave`. Every second stage is run in reverse
     order.
@@ -221,5 +228,5 @@
                                      ::guard ::discard?]))
 (s/def ::steps      (s/coll-of ::step))
 (s/def ::opts       (s/keys :opt-un [::stages ::stop-on ::initialize
-                                     ::augment ::executor]))
+                                     ::augment ::executor ::out]))
 (s/def ::args       (s/cat :opts ::opts :steps ::steps))

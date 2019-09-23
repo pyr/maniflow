@@ -116,6 +116,13 @@
                      :output     [{:id :inc :timing 1}
                                   {:id :inc :timing 1}]}}))))
 
+(deftest out-value-test
+
+  (is (= 2 @(run {:x 0}
+              {:out [:x]}
+              [(step :inc inc :lens :x)
+               (step :inc inc :lens :x)]))))
+
 
 (deftest build-stages-test
   (is (=
