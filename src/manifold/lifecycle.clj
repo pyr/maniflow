@@ -15,16 +15,17 @@
             [manifold.deferred  :as d]
             [manifold.executor  :as pool]))
 
-(defn- ^:no-doc as-vector
-  [x]
-  (cond-> x (not (sequential? x)) vector))
+(def stages
+  "Fixed list of stages to run through"
+  [:enter :leave])
 
 (defn step*
   "Convenience function to build a step map.
    Requires and ID and handler, and can be fed
    additional options"
-  [id handlers {:keys [in out lens guard discard?]}]
-  (let [[enter leave] (as-vector handlers)]
+  [id handlers {:keys [in out lens guard discard? error]}]
+  (let [as-vector     #(cond-> % (not (sequential? %)) vector)
+        [enter leave] (as-vector handlers)]
     (cond-> {:id id}
       (some? enter)    (assoc :enter enter)
       (some? leave)    (assoc :leave leave)
@@ -32,13 +33,13 @@
       (some? out)      (assoc :out (as-vector out))
       (some? lens)     (assoc :lens (as-vector lens))
       (some? guard)    (assoc :guard guard)
+      (some? error)    (assoc :error error)
       (some? discard?) (assoc :discard? discard?))))
 
 (defn step
   "Convenience function to build a step map.
    Requires and ID and handler, and can be fed
    additional options"
-  ;;  [id enter leave & {:as params}]
   ([enter]
    (step (keyword (gensym "handler")) [enter]))
   ([id handlers & {:as params}]
@@ -80,13 +81,15 @@
   [{:keys [handler guard in out lens discard? augment stop-on] :as step} context]
   (let [context (cond-> context (some? augment) (augment step))
         rethrow (rethrow-exception-fn context step)]
+    (when (nil? handler)
+      (throw (ex-info (str "corrupt step: " (pr-str step)) {:step step})))
     (try
       (if (or (nil? guard) (guard context))
-        (-> (d/chain (handler (extract-input step context))
-                     (assoc-result-fn step context)
-                     (juxt identity stop-on))
+        (-> (d/chain (extract-input step context)
+                     handler
+                     (assoc-result-fn step context))
             (d/catch rethrow))
-        [context])
+        context)
       (catch Exception e (rethrow e)))))
 
 (defn- validate-args!
@@ -96,20 +99,31 @@
     (let [msg (s/explain-str ::args [opts steps])]
       (throw (ex-info msg {:type :error/incorrect :message msg})))))
 
+(defn error-handlers-for
+  "A list of error handlers to try in sequence for a specific stage"
+  [id handlers]
+  (->> (reverse handlers)
+       (drop-while #(not= id (:id %)))
+       (map :error)
+       (filter some?)))
+
 (defn prepare-stage
   "Prepare a single stage, discard steps which do not have a handler
    for a specific stage."
-  [stage opts steps]
-  (let [clean-stages #(apply dissoc % (:stages opts [:enter :leave]))
+  [stage opts steps error-handlers]
+  (let [clean-stages #(apply dissoc % stages)
         extra        {:augment (:augment opts)
                       :stop-on (or (:stop-on opts)
                                    (:terminate-when opts)
                                    (constantly false))}]
     (vec (for [step  steps
-               :let  [handler (get step stage)]
+               :let  [handler (get step stage)
+                      id      (:id step)]
                :when (some? handler)]
            (-> step
-               (assoc :stage stage :handler handler)
+               (assoc :stage stage
+                      :handler handler
+                      :error (error-handlers-for id error-handlers))
                (dissoc stage)
                (clean-stages)
                (merge extra))))))
@@ -118,31 +132,57 @@
   "Given a list of steps, prepare a flat vector of actions
    to take in sequence. If options do not specify a stage,
    assume `:enter` and `:leave`"
-  [{:keys [stages] :as opts} steps]
-  (loop [[stage & stages] (or stages [:enter :leave])
-         steps            steps
-         prepared         []]
-    (if (nil? stage)
-      (vec prepared)
-      (recur stages
-             (reverse steps)
-             (concat prepared (prepare-stage stage opts steps))))))
+  [opts steps]
+  (let [error-handlers   (map #(select-keys % [:id :error]) steps)
+        [stage & stages] stages
+        steps            steps
+        prepared         []]
+    (vec
+     (concat (prepare-stage :enter opts steps error-handlers)
+             (prepare-stage :leave opts (reverse steps) error-handlers)))))
 
 (defprotocol ^:no-doc Restarter
   "A protocol to allow restarts"
-  (restart-step [this step]  "Run an asynchronous operation")
-  (restart      [this value] "Success callback"))
+  (restart-step [this step]
+    "Run an asynchronous operation")
+  (restart-success [this value]
+    "Success callback")
+  (forward-failure [this e]
+    "Failure callback, walks back the chain of stages to
+     find a potential handler"))
 
-(defrecord DeferredRestarter [executor steps out result]
+(defrecord DeferredRestarter [executor steps stop-on out result value error-chain]
   Restarter
   (restart-step [this value]
     (let [[step & steps] steps]
       (d/on-realized (d/chain (d/future-with executor (run-step step value)))
-                     (partial restart (assoc this :steps steps))
-                     (partial d/error! result))))
-  (restart [this [value stop?]]
-    (let [step (first steps)
-          exit (cond-> value (some? out) (get-in out))]
+                     (partial restart-success
+                              (assoc this :steps steps))
+                     (partial forward-failure
+                              (assoc this
+                                     :steps steps
+                                     :error-chain (:error step)
+                                     :value value)))))
+  (forward-failure [this e]
+    (let [[handler & handlers] error-chain
+          last?                (nil? (first steps))
+          success?             (not (instance? Exception e))]
+      (cond
+        success?
+        (restart-success this e)
+
+        (nil? handler)
+        (d/error! result e)
+
+        :else
+        (d/chain (handler step value e)
+                 (partial forward-failure
+                          (assoc this :error-chain handlers))))))
+
+  (restart-success [this value]
+    (let [step  (first steps)
+          stop? (when (some? stop-on) (stop-on value))
+          exit  (cond-> value (some? out) (get-in out))]
       (cond
         (nil? step) (d/success! result exit)
         stop?       (d/success! result exit)
@@ -151,11 +191,12 @@
 (defn ^:no-doc make-restarter
   "Build a restarter"
   [opts steps]
-  (DeferredRestarter.
-    (or (:executor opts) (pool/execute-pool))
-    (build-stages opts steps)
-    (:out opts)
-    (d/deferred)))
+  (map->DeferredRestarter
+   {:executor (or (:executor opts) (pool/execute-pool))
+    :steps    (build-stages opts steps)
+    :stop-on  (:stop-on opts)
+    :out      (:out opts)
+    :result   (d/deferred)}))
 
 (defn run
   "
@@ -183,7 +224,7 @@
   In the three-arity version, an extra options maps can
   be provided, with the following keys:
 
-      [:augment :executor :initialize :stages :stop-on]
+      [:augment :executor :initialize :stop-on]
 
   - `augment` is a function called on the context for each step,
     expected to yield an updated context. This can useful to
@@ -193,9 +234,6 @@
     running the lifecycle.
   - `out` a path in the context to retrieve as the final
      value out of the lifecycle
-  - `stages` a list of stages to run through, defaults to
-    `:enter` and `:leave`. Every second stage is run in reverse
-    order.
   - `stop-on` predicate which determines whether an early stop is
     mandated, for compatibility with interceptors `terminate-when`
     is synonymous."
@@ -227,6 +265,6 @@
                             :opt-un [::enter ::leave ::in ::out ::lens
                                      ::guard ::discard?]))
 (s/def ::steps      (s/coll-of ::step))
-(s/def ::opts       (s/keys :opt-un [::stages ::stop-on ::initialize
+(s/def ::opts       (s/keys :opt-un [::stop-on ::initialize
                                      ::augment ::executor ::out]))
 (s/def ::args       (s/cat :opts ::opts :steps ::steps))
